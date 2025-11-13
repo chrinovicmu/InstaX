@@ -49,7 +49,7 @@ std::optional<ElfLoaderResult> loadELfFile(const std::filesystem::path& path){
                                seg->get_data() + seg->get_file_size());
         }
 
-        /*use lowest virtual address amonf all segemnts to determine ELF's base load address */ '
+        /*use lowest virtual address amonf all segemnts to determine ELF's base load address */ 
         if(result.baseAddress == 0 || seg->get_virtual_address() < result.baseAddress)
             result.baseAddress = seg->get_virtual_address(); 
     }
