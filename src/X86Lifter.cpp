@@ -772,7 +772,12 @@ private:
 
             //signed multiply 
             case ZYDIS_MNEMONIC_IMUL:
-                
+            
+                //if single operand multiply 
+                if(z.operand_count_visible == 1){
+                    
+                    IRValue rax = readReg(ZYDIS_REGISTER_RAX)
+                }
                 
 
         }
