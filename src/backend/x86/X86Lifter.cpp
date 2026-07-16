@@ -1,5 +1,6 @@
 
 #include "X86Lifter.hpp"
+#include "FlagState.hpp"
 
 #include <Zydis/Zydis.h>
 #include <elfio/elfio.hpp>
@@ -392,12 +393,8 @@ private:
     //maps basic block leader VA -> IR block label string
     std::unordered_map<uint64_t, std::string> m_blockNames; 
 
-    struct PendingCmp {
-        bool valid = true; 
-        IRValue lhs = IRValue::makeImm(0, IRType::i64(); 
-        IRValue rhs = IRValue::makeImm(0, IRType::i64();
-        bool isTest = false; 
-    }
+    Flags::FlagState m_flagState; 
+
     static std::string makeLabel(uint64_t va){
         std::string ss; 
         ss << "bb_0x" << std::hex << va; 
@@ -890,7 +887,6 @@ private:
             case ZYDIS_MNEMONIC_ADD:
             case ZYDIS_MNEMONIC_SUB:
                 bool isSub = (z.mnemonic == ZYDIS_MNEMONIC_SUB); 
-                Opcode op = isSub ? Opcode::SUB : Opcode::ADD; 
 
                 IRType ty; 
                 if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER){
@@ -908,12 +904,16 @@ private:
                 IRValue rhs = readOperand(ops[1], block, ty); 
 
                 uint32_t id = newTemp(); 
-
                 block.pushInst(IRInst::makeBinop(
-                    op, VReg(id, isSub ? "sub" : "add"), ty, lsh, rhs)); 
+                    isSub ? Opcode::SUB : Opcode::ADD 
+                    ,VReg(id, isSub ? "sub" : "add"), ty, lsh, rhs)); 
 
                 IRValue result = IRValue::makeVReg(id, ty); 
-                emitFlagsForArith(result, lhs, ty, isSub, block);
+            
+                //save flag state 
+                m_flagState.set(isSub ? Flags::FlagOp::SUB : Flags::FlagOp::ADD, 
+                                result, lhs, rhs, ty); 
+
 
                 //write arithmetic result back to it;s destination
                 writeOperand(ops[0], result, block);

@@ -5,7 +5,7 @@
 #include <optional>
 #include <string> 
 
-namespace FlagsSate{
+namespace Flags{
 
 ///which instruction last wrote the flags 
 enum class FlagOp{
