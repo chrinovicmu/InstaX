@@ -409,7 +409,143 @@ private:
         return m_fn.allocVreg(); 
     }
 
+    //computes and stores CF, ZF, SF, OF in their reserved VRegs 
+    //after an arithmetic instruction 
+    //result - IRValue produced by the arithmetic 
+    //lhs - left operand of the arithmetic, needed to computee CF
+    //ty - the IRType the arithmetic ran at (i8,i16,i32)
+    //isSub - true for SUB/CMP (changes how CF is computed))
+    //block - the basic block to push flag- computing IR instruction into 
 
+    void emitFlagsForArith(IRValue result, IRValue lhs, IRType ty, 
+                           bool isSub, IRBasicBlock& block){
+
+        //ZF = 1 if the result is exactly zero, 0 otherwise
+        //emit compare instruction
+        {
+            uint32_t cmpId = newTemp(); 
+            block.pushInst(IRInst::makeIcmp(
+                IcmpCond::EQ 
+                Vreg(cmpId, "zf_cmp"), 
+                result, 
+                IRValue::makeImm(0, ty)));
+
+            //Mov the i1 result into the stable ZF VReg 
+            block.pushInst(IRInst::makeMov(
+                VReg(FlagVreg::ZF, "zf"), 
+                IRType::i1(), 
+                IRValue::makeVReg(cmpId, IRType::i1()))); 
+        }
+
+        //SF: sign flag 
+        //SF = 1 if the result's most significant bit is 1 
+        //in two's compliment arithmetic, the MSB being 1 means 
+        //the value is negative when interpreted as a signed integer 
+        {
+            uint32_t cmpId = newTemp(); 
+            block.pushInst(IRInst::makeIcmp(
+                IcmpCond::SLT, 
+                VReg(cmpId, "sf_cmp"), 
+                result, 
+                IRValue::makeImm(0, ty))); 
+
+            block.pushInst(IRInst::makeMov(
+                VReg(FlagVreg::SF, "sf"), 
+                IRType::i1(), 
+                IRValue::makeVReg(cmpId, IRType::i1()))); 
+        }
+
+        //CF: carry flag 
+        ///for ADD. CF = 1 if unsigned overflow occured 
+        ///for SUB: CF = 1 if unsigned borrow occured 
+        {
+            uint32_t cmpId = newTemp(); 
+            block.pushInst(IRInst::makeIcmp(
+                isSub ? IcmpCond::UGT : IcmpCond::ULT, 
+                VReg(cmpId, "cf_cmp"), 
+                result, 
+                lhs)); 
+
+            block.pushInst(IRInst::makeMov(
+                VReg(FlagVreg::CF, "cf"), 
+                IRType::i1(), 
+                IRValue::makeVReg(cmpId, IRType::i1()))); 
+        }
+
+        //Overflow flag 
+        
+        {
+            // lhs_nn = (lhs >=signed 0)  i.e. lhs was non-negative
+            uint32_t lhsNnId = newTemp();
+            block.pushInst(IRInst::makeIcmp(
+                IcmpCond::SGE,
+                VReg(lhsNnId, "lhs_nn"),
+                lhs,
+                IRValue::makeImm(0, ty)));
+
+            // lhs_neg = (lhs <signed 0)
+            uint32_t lhsNegId = newTemp();
+            block.pushInst(IRInst::makeIcmp(
+                IcmpCond::SLT,
+                VReg(lhsNegId, "lhs_neg"),
+                lhs,
+                IRValue::makeImm(0, ty)));
+
+            // result_lt_lhs = (result <signed lhs)
+            // For ADD with positive lhs: if result < lhs, the addition
+            // pushed us past the max positive value and we wrapped.
+            uint32_t rLtLId = newTemp();
+            block.pushInst(IRInst::makeIcmp(
+                IcmpCond::SLT,
+                VReg(rLtLId, "r_lt_l"),
+                result,
+                lhs));
+
+            // result_gt_lhs = (result >signed lhs)
+            // For SUB / ADD with negative lhs: if result > lhs, the addition
+            // of a negative pushed us past the min negative value and we wrapped.
+            uint32_t rGtLId = newTemp();
+            block.pushInst(IRInst::makeIcmp(
+                IcmpCond::SGT,
+                VReg(rGtLId, "r_gt_l"),
+                result,
+                lhs));
+
+            // pos_overflow = lhs_nn AND result_lt_lhs
+            // (positive lhs, result went negative — wrapped upward)
+            uint32_t posOvId = newTemp();
+            block.pushInst(IRInst::makeBinop(
+                Opcode::AND,
+                VReg(posOvId, "pos_ov"),
+                IRType::i1(),
+                IRValue::makeVReg(lhsNnId, IRType::i1()),
+                IRValue::makeVReg(rLtLId,  IRType::i1())));
+
+            // neg_overflow = lhs_neg AND result_gt_lhs
+            // (negative lhs, result went positive — wrapped downward)
+            uint32_t negOvId = newTemp();
+            block.pushInst(IRInst::makeBinop(
+                Opcode::AND,
+                VReg(negOvId, "neg_ov"),
+                IRType::i1(),
+                IRValue::makeVReg(lhsNegId, IRType::i1()),
+                IRValue::makeVReg(rGtLId,   IRType::i1())));
+
+            // OF = pos_overflow OR neg_overflow
+            uint32_t ofId = newTemp();
+            block.pushInst(IRInst::makeBinop(
+                Opcode::OR,
+                VReg(ofId, "of_cmp"),
+                IRType::i1(),
+                IRValue::makeVReg(posOvId, IRType::i1()),
+                IRValue::makeVReg(negOvId, IRType::i1())));
+
+            block.pushInst(IRInst::makeMov(
+                VReg(FlagVReg::OF, "of"),
+                IRType::i1(),
+                IRValue::makeVReg(ofId, IRType::i1())));
+        }
+    }
     //Returns an IRValue referencing the GPR's fixed Vreg directly
     IRValue readReg(ZydisRegister reg, IRBasicBlock block){
         
@@ -753,12 +889,20 @@ private:
 
             case ZYDIS_MNEMONIC_ADD:
             case ZYDIS_MNEMONIC_SUB:
-                
-                Opcode op = (z.mnemonic == ZYDIS_MNEMONIC_ADD) 
-                            ? Opcode::ADD : Opcode::SUB; 
+                bool isSub = (z.mnemonic == ZYDIS_MNEMONIC_SUB); 
+                Opcode op = isSub ? Opcode::SUB : Opcode::ADD; 
 
-                IRType ty = (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) 
-                            ? typeOfReg(ops[0].reg.value) : IRType::i64(); 
+                IRType ty; 
+                if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER){
+                            ty = typeOfReg(ops[0].reg.value); 
+                }else{
+                    switch(ops[0].size){
+                        case 8:  ty = IRType::i8();  break;
+                        case 16: ty = IRType::i16(); break;
+                        case 32: ty = IRType::i32(); break;
+                        default: ty = IRType::i64(); break;
+                    }
+                }
 
                 IRValue lhs = readOperand(ops[0], block, ty); 
                 IRValue rhs = readOperand(ops[1], block, ty); 
@@ -766,8 +910,13 @@ private:
                 uint32_t id = newTemp(); 
 
                 block.pushInst(IRInst::makeBinop(
-                    op, VReg(id, op == Opcode::ADD ? "add" : "sub"), ty, lsh, rhs)); 
-                writeOperand(ops[0], IRValue::makeVReg(id, ty), block);
+                    op, VReg(id, isSub ? "sub" : "add"), ty, lsh, rhs)); 
+
+                IRValue result = IRValue::makeVReg(id, ty); 
+                emitFlagsForArith(result, lhs, ty, isSub, block);
+
+                //write arithmetic result back to it;s destination
+                writeOperand(ops[0], result, block);
                 break;
 
             //signed multiply 

@@ -66,6 +66,14 @@ enum class Opcode{
     NOP, 
 }; 
 
+//Virtual register IDs reserved for x86 Flags
+namespace FlagsVReg{
+    constexpr uint32_t CF = 16; 
+    constexpr uint32_t ZF - 17; 
+    constexpr uint32_t SF = 18; 
+    constexpr uint32_t 0F = 19; 
+}
+
 class IRType{
 
 public:
@@ -394,7 +402,7 @@ public:
         :   m_name(std::move(name)), 
             m_returnType(returnType); 
             m_callingConv(cc), 
-            m_nextVregId(16) {} //IDs 0-15 reserved for GPR Vregs    
+            m_nextVregId(20) {} //IDs 0-20 reserved for GPR and Flags 
 
     const std::string& name() const { return m_name; }
     const IRType& returnType() const { return m_returnType;  }

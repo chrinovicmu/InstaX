@@ -1,0 +1,29 @@
+; add rax, rbx
+%t20     = add  i64 %rax, %rbx
+%t21     = icmp eq  i64 %t20, 0         
+%zf      = mov  i1  %t21
+
+%t22     = icmp slt i64 %t20, 0 
+%sf      = mov  i1  %t22
+
+%t23     = icmp ult i64 %t20, %rax      
+%cf      = mov  i1  %t23
+
+%t24     = icmp sge i64 %rax, 0         
+%t25     = icmp slt i64 %rax, 0         
+%t26     = icmp slt i64 %t20, %rax      
+%t27     = icmp sgt i64 %t20, %rax      
+%t28     = and  i1  %t24, %t26          
+%t29     = and  i1  %t25, %t27          
+%t30     = or   i1  %t28, %t29      
+%of      = mov  i1  %t30
+
+%rax     = mov  i64 %t20            
+
+%t31     = xor  i1  %sf, %of
+cjmp i1 %t31, bb_somewhere, bb_fallthrough
+
+
+
+
+
