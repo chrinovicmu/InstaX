@@ -920,14 +920,282 @@ private:
                 break;
 
             //signed multiply 
-            case ZYDIS_MNEMONIC_IMUL:
+            case ZYDIS_MNEMONIC_IMUL:{
             
                 //if single operand multiply 
                 if(z.operand_count_visible == 1){
+
+                    IRValue rax = readReg(ZYDIS_REGISTER_RAX, block); 
+                    IRValue src = readOperand(ops[0], block, IRType::i64()); 
                     
-                    IRValue rax = readReg(ZYDIS_REGISTER_RAX)
+                    uint32_t lo = newTemp(); 
+                    block.pushInst(IRInst::makeBinop(
+                        Opcode::MUL, VReg(lo, "imul_lo"), IRType::i64()), block)
+                    writeReg(ZYDIS_REGISTER_RAX, IRValue::makeVReg(lo, IRType::i64()), block); 
+                    writeReg(ZYDIS_REGISTER_RDX, IRValue::makeImm(0, IRType::i64()), block);
+
+                    m_flagState.set(Flags::FlagOp::IMUL, 
+                                    IRValue::makeVReg(lo, IRType::i64()), rax, src, IRType::i64()); 
+
+                }else if (z.operand_count_visible == 2) {
+                    IRType  ty  = typeOfReg(ops[0].reg.value);
+                    IRValue lhs = readOperand(ops[0], block, ty);
+                    IRValue rhs = readOperand(ops[1], block, ty);
+
+                    uint32_t id = newTemp();
+                    block.pushInst(IRInst::makeBinop(
+                        Opcode::MUL, VReg(id, "imul"), ty, lhs, rhs));
+
+                    IRValue result = IRValue::makeVReg(id, ty);
+                    m_flagState.set(Flags::FlagOp::IMUL, result, lhs, rhs, ty);
+                    writeReg(ops[0].reg.value, result, block);
+
+                } else {
+                    IRType  ty  = typeOfReg(ops[0].reg.value);
+                    IRValue lhs = readOperand(ops[1], block, ty);
+                    IRValue rhs = readOperand(ops[2], block, ty);
+
+                    uint32_t id = newTemp();
+                    block.pushInst(IRInst::makeBinop(
+                        Opcode::MUL, VReg(id, "imul3"), ty, lhs, rhs));
+
+                    IRValue result = IRValue::makeVReg(id, ty);
+                    m_flagState.set(Flags::FlagOp::IMUL, result, lhs, rhs, ty);
+                    writeReg(ops[0].reg.value, result, block);
                 }
-                
+                break;
+            }
+
+            //IDIV /DIV 
+            // Flags after DIV/IDIV are architecturally undefined —
+            // no flag state is saved; if a Jcc follows, materialise()
+            // will warn (m_flagState was invalidated or stale).
+            case ZYDIS_MNEMONIC_IDIV:
+            case ZYDIS_MNEMONIC_DIV: {
+                bool     isSigned = (z.mnemonic == ZYDIS_MNEMONIC_IDIV);
+                Opcode   divOp    = isSigned ? Opcode::SDIV : Opcode::UDIV;
+                Opcode   remOp    = isSigned ? Opcode::SREM : Opcode::UREM;
+                IRValue  rax      = readReg(ZYDIS_REGISTER_RAX, block);
+                IRValue  src      = readOperand(ops[0], block, IRType::i64());
+
+                uint32_t qId      = newTemp();
+                uint32_t rId      = newTemp();
+                block.pushInst(IRInst::makeBinop(
+                    divOp, VReg(qId, "div_q"), IRType::i64(), rax, src));
+
+                block.pushInst(IRInst::makeBinop(
+                    remOp, VReg(rId, "div_r"), IRType::i64(), rax, src));
+
+                writeReg(ZYDIS_REGISTER_RAX,
+                         IRValue::makeVReg(qId, IRType::i64()), block);
+                writeReg(ZYDIS_REGISTER_RDX,
+                         IRValue::makeVReg(rId, IRType::i64()), block);
+
+                // Flags undefined after DIV/IDIV — invalidate so any
+                m_flagState.invalidate();
+                break;
+            }
+
+            //  AND / OR / XOR 
+            // CF and OF are always cleared by these; ZF/SF from result.
+            // Width uses destWidth() (fixed, same as ADD/SUB).
+            case ZYDIS_MNEMONIC_AND:
+            case ZYDIS_MNEMONIC_OR:
+            case ZYDIS_MNEMONIC_XOR: {
+                Opcode op  = z.mnemonic == ZYDIS_MNEMONIC_AND ? Opcode::AND
+                           : z.mnemonic == ZYDIS_MNEMONIC_OR  ? Opcode::OR
+                                                               : Opcode::XOR;
+                Flags::FlagOp fop =
+                      z.mnemonic == ZYDIS_MNEMONIC_AND ? Flags::FlagOp::AND
+                    : z.mnemonic == ZYDIS_MNEMONIC_OR  ? Flags::FlagOp::OR
+                                                        : Flags::FlagOp::XOR;
+
+                IRType ty = destWidth(ops[0], ops[1]);
+
+                IRValue lhs = readOperand(ops[0], block, ty);
+                IRValue rhs = readOperand(ops[1], block, ty);
+                uint32_t id = newTemp();
+                block.pushInst(IRInst::makeBinop(op, VReg(id, "bw"), ty, lhs, rhs));
+                IRValue result = IRValue::makeVReg(id, ty);
+
+                m_flagState.set(fop, result, lhs, rhs, ty);
+
+                writeOperand(ops[0], result, block);
+                break;
+            }
+
+            // NOT / NEG (unary)
+            // NOT does not affect flags at all
+            case ZYDIS_MNEMONIC_NOT:
+            case ZYDIS_MNEMONIC_NEG: {
+                bool    isNeg = (z.mnemonic == ZYDIS_MNEMONIC_NEG);
+                Opcode  op    = isNeg ? Opcode::NEG : Opcode::NOT;
+                IRType  ty    = typeOfReg(ops[0].reg.value);
+                IRValue src   = readOperand(ops[0], block, ty);
+
+                uint32_t id   = newTemp();
+                block.pushInst(IRInst::makeUnop(op, VReg(id, "unary"), ty, src));
+                IRValue result = IRValue::makeVReg(id, ty);
+
+                if (isNeg) {
+                    // NEG x == SUB(0, x) for flag purposes.
+                    m_flagState.set(Flags::FlagOp::SUB,
+                        result, IRValue::makeImm(0, ty), src, ty);
+                }
+                // NOT: flags untouched — m_flagState left as-is.
+
+                writeOperand(ops[0], result, block);
+                break;
+            }
+
+            //  SHL / SHR / SAR 
+            case ZYDIS_MNEMONIC_SHL:
+            case ZYDIS_MNEMONIC_SHR:
+            case ZYDIS_MNEMONIC_SAR: {
+                Opcode op = z.mnemonic == ZYDIS_MNEMONIC_SHL ? Opcode::SHL
+                          : z.mnemonic == ZYDIS_MNEMONIC_SHR ? Opcode::LSHR
+                                                              : Opcode::ASHR;
+                Flags::FlagOp fop =
+                      z.mnemonic == ZYDIS_MNEMONIC_SHL ? Flags::FlagOp::SHL
+                    : z.mnemonic == ZYDIS_MNEMONIC_SHR ? Flags::FlagOp::SHR
+                                                        : Flags::FlagOp::SAR;
+
+                IRType  ty  = typeOfReg(ops[0].reg.value);
+                IRValue val = readOperand(ops[0], block, ty);
+                IRValue amt = readOperand(ops[1], block, IRType::i8());
+
+                uint32_t extId = newTemp();
+                block.pushInst(IRInst::makeCast(
+                    Opcode::ZEXT, VReg(extId, "shamt"), ty, amt));
+                uint32_t id = newTemp();
+                block.pushInst(IRInst::makeBinop(
+                    op, VReg(id, "shift"), ty, val, IRValue::makeVReg(extId, ty)));
+                IRValue result = IRValue::makeVReg(id, ty);
+
+                m_flagState.set(fop, result, val,
+                                 IRValue::makeVReg(extId, ty), ty);
+
+                writeOperand(ops[0], result, block);
+                break;
+            }
+
+            //  INC / DEC 
+            // CF is NOT modified by INC/DEC — this is handled inside
+            case ZYDIS_MNEMONIC_INC:
+            case ZYDIS_MNEMONIC_DEC: {
+                bool    isDec = (z.mnemonic == ZYDIS_MNEMONIC_DEC);
+                Opcode  op    = isDec ? Opcode::SUB : Opcode::ADD;
+                IRType  ty    = typeOfReg(ops[0].reg.value);
+                IRValue src   = readOperand(ops[0], block, ty);
+                uint32_t id   = newTemp();
+                block.pushInst(IRInst::makeBinop(
+                    op, VReg(id, isDec ? "dec" : "inc"), ty,
+                    src, IRValue::makeImm(1, ty)));
+                IRValue result = IRValue::makeVReg(id, ty);
+
+                m_flagState.set(
+                    isDec ? Flags::FlagOp::DEC : Flags::FlagOp::INC,
+                    result, src, IRValue::makeImm(1, ty), ty);
+
+                writeOperand(ops[0], result, block);
+                break;
+            }
+
+            // CMP src0, src1 
+            // emit the SUB instruction (its output feeds flag
+            case ZYDIS_MNEMONIC_CMP: {
+                IRType ty = (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                    ? typeOfReg(ops[0].reg.value)
+                    : typeFromEncodedSize(ops[0].size);
+
+                IRValue lhs = readOperand(ops[0], block, ty);
+                IRValue rhs = readOperand(ops[1], block, ty);
+                uint32_t id = newTemp();
+                block.pushInst(IRInst::makeBinop(
+                    Opcode::SUB, VReg(id, "cmp_sub"), ty, lhs, rhs));
+                IRValue result = IRValue::makeVReg(id, ty);
+
+                m_flagState.set(Flags::FlagOp::SUB, result, lhs, rhs, ty);
+                // No writeOperand — CMP discards the arithmetic result.
+                break;
+            }
+
+            // TEST src0, src1
+            // Semantically AND with the result discarded.
+            case ZYDIS_MNEMONIC_TEST: {
+                IRType ty = (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                    ? typeOfReg(ops[0].reg.value)
+                    : typeFromEncodedSize(ops[0].size);
+
+                IRValue lhs = readOperand(ops[0], block, ty);
+                IRValue rhs = readOperand(ops[1], block, ty);
+                uint32_t id = newTemp();
+                block.pushInst(IRInst::makeBinop(
+                    Opcode::AND, VReg(id, "test_and"), ty, lhs, rhs));
+                IRValue result = IRValue::makeVReg(id, ty);
+
+                m_flagState.set(Flags::FlagOp::AND, result, lhs, rhs, ty);
+                break;
+            }
+
+            //Conditional branches 
+            //This is were the flag resoultion IR is emmited 
+            case ZYDIS_MNEMONIC_JZ:  
+            case ZYDIS_MNEMONIC_JNZ:
+            case ZYDIS_MNEMONIC_JS:   
+            case ZYDIS_MNEMONIC_JNS:
+            case ZYDIS_MNEMONIC_JO:   
+            case ZYDIS_MNEMONIC_JNO:
+            case ZYDIS_MNEMONIC_JB:   
+            case ZYDIS_MNEMONIC_JNB:
+            case ZYDIS_MNEMONIC_JBE:  
+            case ZYDIS_MNEMONIC_JNBE:
+            case ZYDIS_MNEMONIC_JL:   
+            case ZYDIS_MNEMONIC_JNL:
+            case ZYDIS_MNEMONIC_JLE:  
+            case ZYDIS_MNEMONIC_JNLE:{
+
+                //address of instruction that would be executed if the jump is taken 
+                uint64_t takenVA = 0; 
+
+                //address of instruction immediately following this jcc (natural fallthrough )
+                uint64_t fallthroughVA = di.va + di.length;
+
+                //iterate through all viiable operands of the decode instruction
+                for(uint8_t k = 0; k < z.operand_count_visible; ++k){
+                    //look for an immediate operand that is a relative displacement
+                    if(ops[k].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && 
+                       ops[k].imm.is_relative){
+                        takenVA = di.va + di.length 
+                            + static_cast<uint64_t>(
+                                static_cast<int_64>(ops[k].imm.value.s)); 
+                        break 
+                    }
+                }
+
+                auto takentIt = m_blockNames.find(takenVA); 
+                auto fallthroughIt = m_blockNames.find(fallthroughVA);
+
+                std::string trueSymLabel = (takentIt != m_blockNames.end())
+                    ? takentIt->second : "unknown"; 
+                std::string falseSymLabel = (fallthroughIt != m_blockNames.end())
+                    ? fallthroughIt->second : "unknown"; 
+
+                //what flah condition this particular jcc mnemonic need 
+                auto req Flags::flagRequestForJcc(z.mnemonic); 
+
+                IRValue cond; 
+                if(req.has_value()){
+                    cond = m_flagState.materialise(
+                        *req, block, [this]{return newTemp();});
+                }else{
+                    block.pushInst(IRInst::makeJmp(falseSymLabel)); 
+                    break; 
+                }
+
+                block.pushInst(IRInst::makeCjmp(cond, trueSymLabel, false falseSymLabel)); 
+                break; 
+            }
 
         }
     }
