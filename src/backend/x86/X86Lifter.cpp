@@ -1231,7 +1231,53 @@ private:
 
             case ZYDIS_MNEMONIC_CALL: {
                 IRValue callee = IRValue::makeImm(0, IRType::ptr()); 
-                IRType retType = IRType::i64(); 
+                IRType retTy = IRType::i64();
+
+                //Direct call 
+                if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && 
+                    ops[0].imm.is_relative) {
+
+                    uint64_t targetVA = di.va + di.length + 
+                        static_cast<uint64_t>(
+                        static_cast<int64_t>(ops[0].imm.value.s));
+
+                    std::string sym = program.symbolAt(targetVA); 
+                    
+                    callee = sym.empty() 
+                        ? IRValue::makeImm(static_cast<int64_t>(targetVA), IRType::ptr())
+                        : IRValue::makeGlobal(sym, IRType::ptr());
+
+                }else {
+                    //Indirect call 
+                    IRValue addrVal = readOperand(ops[0], block, IRType::i64()); 
+                    uint32_t ptrId = newTemp(); 
+                    block.pushInst(IRInst::makeCast(
+                        Opcode::INTTOPTR, 
+                        VReg(ptrId, "icall_ptr"), 
+                        IRType::ptr(), 
+                        addrVal)); 
+                    
+                    callee = IRValue::makeVReg(ptrId, IRType::ptr());
+                }
+                //emit call instruction 
+
+                uint32_t retId = newTemp(); 
+
+                block.pushInst(IRInst::makeCall(
+                    VReg(retId, "retval"), 
+                    retTy, 
+                    callee, 
+                    {}, 
+                    CallingConv::C, 
+                    false)); 
+
+                
+                writeReg(ZYDIS_REGISTER_RAX,
+                    IRValue::makeVReg(retId, retTy),
+                    block);
+
+                m_flagState.invalidate(); 
+                break; 
 
             }
 
