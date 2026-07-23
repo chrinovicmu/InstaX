@@ -1197,6 +1197,44 @@ private:
                 break; 
             }
 
-        }
-    }
+            // JMP (unconditional branch)
+            case ZYDIS_MNEMONIC_JMP: {
+                uint64_t targetVA = 0;
 
+                for (uint8_t k = 0; k < z.operand_count_visible; ++k) {
+                    if(ops[k].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && 
+                       ops[k].imm.is_relative){
+                        targetVA = di.va + di.length + 
+                            static_cast<uint64_t>(static_cast<int64_t>(ops[k].imm.value)); 
+                
+                        break; 
+                    }
+                }
+
+                auto it = m_blockNames.find(targetVA); 
+                if(it != m_blockNames.end()){
+                    block.pushInst(IRInst::makeJmp(it->second)); 
+                }else{
+                    //indirect jump - needs value-set analysis 
+                    //stub with source-tagged NOP for now 
+                    IRInst nop = IRInst::makeNop() ;
+                    nop.setSourceAddr(di.va); 
+                    block.pushInst(std::move(nop)); 
+                }
+                break; 
+            }
+
+            // call 
+            // Flags are clobbered by an abitrary callee under 
+            // system V ABI, so invalidate the flag state after 
+            // the emitting the call for now 
+
+            case ZYDIS_MNEMONIC_CALL: {
+                IRValue callee = IRValue::makeImm(0, IRType::ptr()); 
+                IRType retType = IRType::i64(); 
+
+            }
+
+            
+    }
+}

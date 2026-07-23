@@ -202,6 +202,175 @@ uint64_t IRInst::allocaBytes() const {
     return *m_allocaBytes;
 }
 
+//record a mappping from an ELF virtual address to the symbol name found at the address 
+void IRProgram::registerSymbol(uint64_t addr, std::string name){
+    m_addrToSymbol[addr] = std::move(name); 
+}
+
+//look up symbol registered at a given address 
+std::string IRProgram::symbolAt(uint64_t addr) const{
+    auto it = m_addrToSymbol.find(addr); 
+    if(it == m_addrToSymbol.end())
+        return ""; 
+    return it-second; 
+}
+
+//appen one lifeted global to the program 
+void IRProgram::addGlobal(IRGlobal global){
+    m_globals.push_back(std::move(gloabl)); 
+}
+
+//append one fully-lifted function to the program
+void IRProgram::addFunction(IRFunction fn){
+    m_functions.push_back(std::mov(fn)); 
+}
+
+// findFunction (non-const) — looks up a function by name, returning
+// a mutable pointer so callers can modify it in place 
+IRFunction* IRProgram::findFunction(const std::string& name) {
+
+    for (auto& fn : m_functions) {
+        if (fn.name() == name)
+            return &fn;
+    }
+    return nullptr;
+}
+
+// findFunction (const) — read-only counterpart, identical logic,
+// duplicated because C++ requires separate const/non-const overloads
+// (a const method can't return a non-const pointer into itself).
+const IRFunction* IRProgram::findFunction(const std::string& name) const {
+    for (const auto& fn : m_functions) {
+        if (fn.name() == name)
+            return &fn;
+    }
+    return nullptr;
+}
+
+// findBlock (non-const) — looks up a basic block within THIS function
+// by its label name (e.g. "bb_0x401010").
+IRBasicBlock* IRFunction::findBlock(const std::string& name) {
+    for (auto& block : m_blocks) {
+        if (block.name() == name)
+            return &block;
+    }
+    return nullptr;
+}
+
+// findBlock (const) — same as above, read-only overload.
+const IRBasicBlock* IRFunction::findBlock(const std::string& name) const {
+    for (const auto& block : m_blocks) {
+        if (block.name() == name)
+            return &block;
+    }
+    return nullptr;
+}
+
+
+// entryBlock (non-const) — returns the function's first basic block.
+IRBasicBlock& IRFunction::entryBlock() {
+    if (m_blocks.empty())
+        throw std::logic_error(
+            "IRFunction::entryBlock: function '" + m_name + "' has no blocks");
+    return m_blocks.front();
+}
+
+// entryBlock (const) — read-only counterpart.
+const IRBasicBlock& IRFunction::entryBlock() const {
+    if (m_blocks.empty())
+        throw std::logic_error(
+            "IRFunction::entryBlock: function '" + m_name + "' has no blocks");
+    return m_blocks.front();
+}
+
+// isTerminated — returns true if this block already ends with a
+// control-flow instruction (JMP, CJMP, or RET).
+// Called from two places:
+//   1. IRBasicBlock::pushInst (below) — to refuse adding instructions
+//      after a terminator, catching lifter bugs early and loudly
+//      instead of silently producing malformed IR.
+//   2. FunctionLifter::liftBlock — to decide whether a fallthrough
+//      JMP needs to be synthesised after all of a block's x86
+//      instructions have been lifted (e.g. if the block just falls
+//      into the next one without an explicit jump in the original
+//      x86 code).
+bool IRBasicBlock::isTerminated() const {
+    if (m_instructions.empty())
+        return false;
+
+    // Only the LAST instruction matters — a terminator can only
+    // legally appear at the end of a well-formed block. We don't
+    // scan the whole vector; we just check the opcode of the final
+    // entry.
+    switch (m_instructions.back().opcode()) {
+        case Opcode::JMP:
+        case Opcode::CJMP:
+        case Opcode::RET:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// terminator — returns a reference to the block's terminating
+// instruction (the last instruction, which must be JMP/CJMP/RET).
+const IRInst& IRBasicBlock::terminator() const {
+    if (!isTerminated())
+        throw std::logic_error(
+            "IRBasicBlock::terminator: block '" + m_name
+            + "' has no terminating instruction");
+
+    return m_instructions.back();
+}
+
+void IRBasicBlock::pushInst(IRInst inst) {
+    // Guard: refuse to add ANY instruction after a terminator has
+    // already been pushed. This is what catches the class of bug
+    // discussed earlier — e.g. if liftBlock() were ever called with
+    // a malformed CFGBuilder result that put instructions after a
+    // JMP/CJMP/RET, this throws immediately at the exact push that
+    // caused it, rather than producing silently-dead instructions
+    // that a later pass might trip over in a much more confusing way.
+    if (isTerminated())
+        throw std::logic_error(
+            "IRBasicBlock::pushInst: cannot push after a terminator in block '"
+            + m_name + "'");
+
+    // Move the instruction into the vector — IRInst holds a
+    // std::vector<IRValue> of operands plus several std::string/
+    // std::optional fields, so moving avoids an unnecessary deep copy
+    // on every single push (and there are many pushes per x86
+    // instruction lifted).
+    m_instructions.push_back(std::move(inst));
+}
+
+// addPredecessor — records that another block can jump/fall through
+// INTO this block.
+//
+// Not currently populated by X86Lifter.cpp (the lifter builds blocks
+// and their instructions, but doesn't yet wire up the predecessor/
+// successor lists — that's a gap worth closing: a CFG-construction
+// step after FunctionLifter::lift() should walk every block's
+// terminator and call addPredecessor/addSuccessor on the appropriate
+// pairs). Declared here so that step has something to call into once
+// you add it.
+void IRBasicBlock::addPredecessor(std::string blockName) {
+    // No de-duplication — if the same predecessor is added twice
+    // (which shouldn't happen with correct CFG-construction logic),
+    // it will appear twice in predecessors(). This is deliberately
+    // left as a caller responsibility rather than silently
+    // de-duplicating here, so that a duplicate is visible in the
+    // printed IR's "; preds = " comment and can be caught as a bug
+    // in whatever code populates the CFG.
+    m_predecessors.push_back(std::move(blockName));
+}
+
+// addSuccessor — records that this block can jump/fall through INTO
+// another block. Symmetric counterpart to addPredecessor.
+void IRBasicBlock::addSuccessor(std::string blockName) {
+    m_successors.push_back(std::move(blockName));
+}
+
 std::string toString(IRTypeKind k) {
     switch (k) {
         case IRTypeKind::Void: return "void";
