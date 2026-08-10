@@ -740,6 +740,10 @@ private:
         }
     }
 
+
+    void pushStack(IRValue val, IRBasicBlock& block){
+
+    }
     //Maps the zydis mnemonic of a conditional jump to the 
     //corresponding IcmpCond that should be emmited 
 
