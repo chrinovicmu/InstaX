@@ -166,17 +166,17 @@ GuestMemory::~GuestMemory(){
 }
 
 //address translation 
-void* GuestMemory::toHost(uint64_t guestAddr){
+inline const void* GuestMemory::toHost(uint64_t guestAddr) const {
     if(!isMapped(guestAddr, 1))
         throw std::out_of_range(
             "GuestMemory::toHost: unmapped guest address 0x" +
             [&]{ std::ostringstream o; o << std::hex << guestAddr; return o.str(); }());
 
-    return reinterpret_cast<void*>(guestAddr + m_hostOffset);
+    return reinterpret_cast<const void*>(guestAddr + m_hostOffset);
 }
 
-const void* GuestMemory::toHost(uint64_t guestAddr) const{
-    return const_cast<GuestMemory*>(this)->toHost(guestAddr); 
+inline void* GuestMemory::toHost(uint64_t guestAddr) {
+    return const_cast<void*>(std::as_const(*this).toHost(guestAddr));
 }
 
 uint64_t GuestMemory::toGuest(const void* hostptr) const{
@@ -190,8 +190,164 @@ void GuestMemory::map(uint64_t guestAddr, uint64_t length, int guestProt,
     if(length == 0)
         return; 
 
+    const uint64_t start = guestPageAlignDown(guestAddr); 
+    const uint64_t end = guestPageAlignUp(guestAddr + length); 
+    const uint64_t size = end - start; 
 
+    const uint64_t hostPage = hostPageSize(); 
+    const uint64_t hostStart = alignDown(start, hostPage); 
+    const uint64_t hostEnd = alignUp(end, hostPage); 
+
+    if (!isAddressable(start, size)) {
+        std::ostringstream o;
+        o << "GuestMemory::map: guest range [0x" << std::hex << start
+          << ", 0x" << end << ") for '" << name
+          << "' lies outside the reserved window [0x" << m_reservedLow
+          << ", 0x" << m_reservedHigh << ") — in biased mode every guest "
+             "address must fall inside the single reservation";
+        throw std::runtime_error(o.str());
+    }
+
+    void *const desired = reinterpret_cast<void*>(hostStart + m_hostOffset); 
+
+    const bool insideReservation = 
+        (start >= m_reservedLow) && (end <= m_reservedHigh); 
+
+    const int fixedFlag = insideReservation > MAP_FIXED : MAP_FIXED_NOREPLACE; 
+
+    void *got = ::mmap(desired, 
+                      hostEnd - hostStart, 
+                      PROT_READ | PROT_WRITE, 
+                      MAP_PRIVATE | MAP_ANONYMOUS | fixedFlag, 
+                      -1, 0);
+
+    if (got == MAP_FAILED || got != desired) {
+        if (got != MAP_FAILED)
+            ::munmap(got, hostEnd - hostStart);
+
+        std::ostringstream o;
+        o << "GuestMemory::map: failed to map guest range [0x" << std::hex
+          << start << ", 0x" << end << ") for '" << name << "'";
+        if (!insideReservation)
+            o << " — the host refused this address; it is already occupied";
+        throw std::runtime_error(o.str());
+    }
+
+    m_regions.push_back(GuestRegion(start, size, guestProt, std::move(name))); 
 }
+
+void GuestMemory::protect(uint64_t guestAddr, uint64_t length, int guestProt, 
+                          const std::string& name ){
+
+    if(length == 0)
+        return; 
+
+    const uint64_t start = guestPageAlignDown(guestAddr); 
+    const uint64_t end = guestPageAlignUp(guestAddr + length); 
+
+    std::vector<GuestRegion> rebuilt; 
+    rebuilt.reserve(m_regions.size() + 2); 
+
+    bool covered = false; 
+
+    for(const auto& region: m_regions){
+        const uint64_t regionStart = region.guestAddr; 
+        const uint64_t regionEnd = region.guestAddr + region.length; 
+
+        if(regionEnd <= start || end <= regionStart){
+            rebuilt.push_back(region); 
+            continue; 
+        }
+
+        if(regionStart < start){
+            rebuilt.push_back(GuestRegion{
+                regionStart, start - regionStart, region.prot, region.name}); 
+        }
+
+        const uint64_t bodyStart = std::max(regionStart, start); 
+        const uint64_t bodyEnd = std::min(regionEnd, end); 
+        rebuilt.push_back(GuestRegion{
+            bodyStart, bodyEnd - bodyStart, guestProt,
+            name.empty() ? region.name : name});
+        covered = true;
+
+        if (end < regionEnd){
+            rebuilt.push_back(GuestRegion{
+                end, regionEnd - end, region.prot, region.name});
+        }
+    }
+
+    if (!covered)
+        throw std::out_of_range(
+            "GuestMemory::protect: range is not mapped");
+
+    m_regions = std::move(rebuilt);
+
+    // Keep the list address-ordered so the memory dump reads top to bottom.
+    std::sort(m_regions.begin(), m_regions.end(),
+              [](const GuestRegion& a, const GuestRegion& b) {
+                  return a.guestAddr < b.guestAddr;
+              });
+
+    applyHostProtection(start, end - start, guestProt);
+}
+
+
+void GuestMemory::applyHostProtection(uint64_t guestAddr, uint64_t length,
+                                      int guestProt) {
+    const uint64_t hostPage  = hostPageSize();
+    const uint64_t hostStart = alignDown(guestAddr, hostPage);
+    const uint64_t hostEnd   = alignUp(guestAddr + length, hostPage);
+
+    void* const addr = reinterpret_cast<void*>(hostStart + m_hostOffset);
+
+    if (::mprotect(addr, hostEnd - hostStart, hostProtFor(guestProt)) != 0) {
+        // Deliberately silent. Turning this into an exception would make
+        // perfectly loadable binaries fail on hosts with 16 KiB pages.
+    }
+}
+
+void GuestMemory::write(uint64_t guestAddr, const void* src, size_t n) {
+    if (n == 0) return;
+    if (!isMapped(guestAddr, n)) {
+        std::ostringstream o;
+        o << "GuestMemory::write: [0x" << std::hex << guestAddr << ", 0x"
+          << (guestAddr + n) << ") is not fully mapped";
+        throw std::out_of_range(o.str());
+    }
+    std::memcpy(toHost(guestAddr), src, n);
+}
+
+void GuestMemory::read(uint64_t guestAddr, void* dst, size_t n) const {
+    if (n == 0) return;
+    if (!isMapped(guestAddr, n)) {
+        std::ostringstream o;
+        o << "GuestMemory::read: [0x" << std::hex << guestAddr << ", 0x"
+          << (guestAddr + n) << ") is not fully mapped";
+        throw std::out_of_range(o.str());
+    }
+    std::memcpy(dst, toHost(guestAddr), n); 
+}
+
+
+void GuestMemory::zero(uint64_t guestAddr, size_t n) {
+    if (n == 0) return;
+    if (!isMapped(guestAddr, n)) {
+        std::ostringstream o;
+        o << "GuestMemory::zero: [0x" << std::hex << guestAddr << ", 0x"
+          << (guestAddr + n) << ") is not fully mapped";
+        throw std::out_of_range(o.str());
+    }
+    std::memset(toHost(guestAddr), 0, n);
+}
+
+
+uint64_t GuestMemory::read64(uint64_t guestAddr) const {
+    uint64_t value = 0;
+    read(guestAddr, &value, sizeof(value));
+    return value;
+}
+
 const GuestRegion* GuestMemory::findRegion(uint64_t guestAddr){
     for(const auto& region: m_regions){
         if(guestAddr >= region.guestAddr && 
@@ -218,6 +374,11 @@ bool GuestMemory::isMapped(uint64_t guestAddr, uint64_t length) const{
     }
 
     return true; 
+}
+
+int GuestMemory::protAt(uint64_t guestAddr) const {
+    const GuestRegion* region = findRegion(guestAddr);
+    return region ? region->prot : kProtNone;
 }
 
 void GuestMemory::dump(std::ostream& os) const {
