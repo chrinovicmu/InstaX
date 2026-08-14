@@ -175,7 +175,23 @@ void* GuestMemory::toHost(uint64_t guestAddr){
     return reinterpret_cast<void*>(guestAddr + m_hostOffset);
 }
 
+const void* GuestMemory::toHost(uint64_t guestAddr) const{
+    return const_cast<GuestMemory*>(this)->toHost(guestAddr); 
+}
 
+uint64_t GuestMemory::toGuest(const void* hostptr) const{
+    return reinterpret_cast<uint64_t>(hostptr) - m_hostOffset; 
+}
+
+
+void GuestMemory::map(uint64_t guestAddr, uint64_t length, int guestProt, 
+                      std::string name){
+
+    if(length == 0)
+        return; 
+
+
+}
 const GuestRegion* GuestMemory::findRegion(uint64_t guestAddr){
     for(const auto& region: m_regions){
         if(guestAddr >= region.guestAddr && 
