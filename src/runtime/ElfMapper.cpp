@@ -172,6 +172,81 @@ GuestElfImage mapImage(const ElfFile& file, GuestMemory& mem, uint64_t loadBias)
     image.loadLow  = spanLow  + loadBias;
     image.loadHigh = spanHigh + loadBias;
 
+    //map entire image 
+    mem.map(image.loadLow, image.loadHigh - image.loadLow, 
+            kProtRead | kProtWrite, "iamge");
+
+    //copy each segment's content
+
+    for(const auto& ph : file.phdrs){
+        if(ph.p_type != Elf::PT_LOAD || ph.p_memsz == 0) 
+            continue; 
+
+        const uint64_t guestAddr = ph.p_vaddr + loadBias;
+
+        // Bounds-check the file range before reading it. A corrupt or
+        // hostile p_offset/p_filesz would otherwise read past our buffer.
+        if (ph.p_filesz > 0) {
+            if (ph.p_offset > file.bytes.size() ||
+                file.bytes.size() - ph.p_offset < ph.p_filesz) {
+                std::ostringstream o;
+                o << "ELF: PT_LOAD claims " << ph.p_filesz
+                  << " bytes at file offset 0x" << std::hex << ph.p_offset
+                  << ", which runs past the end of the file";
+                throw std::runtime_error(o.str());
+            }
+
+            mem.write(guestAddr, 
+                      file.bytes() + ph.p_offset, 
+                      static_cast<size_t>(ph.p_filesz)); 
+        }
+
+        //for .bss 
+        if(ph.p_memsz > ph.p_filesz){
+            mem.zero(guestAddr + ph.p_filesz, 
+                     static_cast<size_t>(ph.p_memsz - ph.p_filesz)); 
+        }
+    }
+
+    //apply per-segment permisson 
+    for (const auto& ph : file.phdrs) {
+        if (ph.p_type != Elf::PT_LOAD || ph.p_memsz == 0)
+            continue;
+
+        const uint64_t guestAddr = ph.p_vaddr + loadBias;
+        const int prot = protFromPhdrFlags(ph.p_flags);
+
+        // Label the region by what it actually is, which makes the memory
+        // dump readable: "r-x" is the text segment, "rw-" the data segment.
+        std::string label = "image ";
+        label += protToString(prot);
+
+        if (ph.p_flags & Elf::PF_X){
+            label += " (text)";
+        }else if (ph.p_flags & Elf::PF_W){
+            label += " (data/bss)";
+        }else{
+            label += " (rodata)";
+        }
+
+        mem.protect(guestAddr, ph.p_memsz, prot, label);
+    }
+
+    //other program header we casr about 
+    for(const auto& ph : file.phdrs){
+        switch(ph.p_type){
+
+            case Elf::PT_INTERP: 
+                
+                image.needsInterp = true; 
+                image.interpPath = readCString(file.bytes, ph.p_offset, "PT_INTERP path"); 
+                break
+            
+            case Elf::PT_DYNAMIC: 
+        }
+    }
+
+
 
 
 }
