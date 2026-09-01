@@ -426,7 +426,127 @@ void applyRelocation(const ElfFile& file, GuestMemory& mem,
     }
 }
 
+void applyRelro(const ElfFile& file, GuestMemory& mem,
+                const GuestElfImage& image) {
+    for (const auto& ph : file.phdrs) {
+        if (ph.p_type != Elf::PT_GNU_RELRO || ph.p_memsz == 0)
+            continue;
 
+        const uint64_t addr = ph.p_vaddr + image.loadBias;
+        mem.protect(addr, ph.p_memsz, kProtRead, "image r-- (relro)");
+    }
+}
+
+namespace {
+
+const char* phdrTypeName(uint32_t type) {
+    switch (type) {
+        case Elf::PT_NULL:         return "NULL";
+        case Elf::PT_LOAD:         return "LOAD";
+        case Elf::PT_DYNAMIC:      return "DYNAMIC";
+        case Elf::PT_INTERP:       return "INTERP";
+        case Elf::PT_NOTE:         return "NOTE";
+        case Elf::PT_PHDR:         return "PHDR";
+        case Elf::PT_TLS:          return "TLS";
+        case Elf::PT_GNU_EH_FRAME: return "GNU_EH_FRAME";
+        case Elf::PT_GNU_STACK:    return "GNU_STACK";
+        case Elf::PT_GNU_RELRO:    return "GNU_RELRO";
+        case Elf::PT_GNU_PROPERTY: return "GNU_PROPERTY";
+        default:                   return "<other>";
+    }
+}
+
+} // namespace
+
+void describeElfFile(const ElfFile& file, std::ostream& os) {
+    const auto& eh = file.ehdr;
+
+    os << "ELF header\n"
+       << "  file        : " << file.path << "\n"
+       << "  type        : "
+       << (eh.e_type == Elf::ET_EXEC ? "ET_EXEC (fixed-address executable)"
+                                     : "ET_DYN  (PIE / shared object)")
+       << "\n"
+       << "  machine     : x86-64\n"
+       << "  entry       : 0x" << std::hex << eh.e_entry << std::dec
+       << "   (file-relative; load bias is added later)\n"
+       << "  phdrs       : " << eh.e_phnum << " entries at file offset 0x"
+       << std::hex << eh.e_phoff << std::dec << "\n"
+       << "  shdrs       : " << eh.e_shnum << " entries at file offset 0x"
+       << std::hex << eh.e_shoff << std::dec
+       << (file.shdrs.empty() ? "   (absent / stripped)" : "") << "\n\n";
+
+    os << "program headers  (what the loader consumes)\n"
+       << "  " << std::left
+       << std::setw(14) << "type"
+       << std::setw(12) << "vaddr"
+       << std::setw(12) << "filesz"
+       << std::setw(12) << "memsz"
+       << std::setw(7)  << "flags"
+       << "note\n";
+
+    for (const auto& ph : file.phdrs) {
+        std::ostringstream vaddr, filesz, memsz;
+        vaddr  << std::hex << "0x" << ph.p_vaddr;
+        filesz << std::dec << ph.p_filesz;
+        memsz  << std::dec << ph.p_memsz;
+
+        std::string note;
+        if (ph.p_type == Elf::PT_LOAD && ph.p_memsz > ph.p_filesz) {
+            std::ostringstream o;
+            o << "+" << (ph.p_memsz - ph.p_filesz) << " bytes zero-filled (.bss)";
+            note = o.str();
+        }
+
+        os << "  " << std::left
+           << std::setw(14) << phdrTypeName(ph.p_type)
+           << std::setw(12) << vaddr.str()
+           << std::setw(12) << filesz.str()
+           << std::setw(12) << memsz.str()
+           << std::setw(7)  << protToString(protFromPhdrFlags(ph.p_flags))
+           << note << "\n";
+    }
+    os << "\n";
+}
+
+void describeImage(const GuestElfImage& image, std::ostream& os) {
+    os << "guest image\n"
+       << "  load bias   : 0x" << std::hex << image.loadBias << std::dec
+       << (image.loadBias == 0 ? "   (mapped at its own addresses)"
+                               : "   (added to every p_vaddr)") << "\n"
+       << "  mapped span : 0x" << std::hex << image.loadLow
+       << " - 0x" << image.loadHigh << std::dec
+       << "   (" << (image.loadHigh - image.loadLow) << " bytes)\n"
+       << "  entry point : 0x" << std::hex << image.entry << std::dec << "\n"
+       << "  initial brk : 0x" << std::hex << image.brk << std::dec
+       << "   (heap grows up from here)\n"
+       << "  AT_PHDR     : 0x" << std::hex << image.phdrAddr << std::dec
+       << "   (" << image.phNum << " headers of "
+       << image.phEntSize << " bytes)\n";
+
+    if (image.needsInterp) {
+        os << "  interpreter : " << image.interpPath << "\n"
+           << "                NOT loaded — see the note below\n";
+    } else {
+        os << "  interpreter : none (statically linked)\n";
+    }
+
+    if (!image.neededLibs.empty()) {
+        os << "  needs       : ";
+        for (size_t i = 0; i < image.neededLibs.size(); ++i) {
+            if (i) os << ", ";
+            os << image.neededLibs[i];
+        }
+        os << "\n";
+    }
+
+    os << "  relocations : " << image.relocApplied << " applied, "
+       << image.relocSkipped << " skipped\n";
+
+    for (const auto& note : image.relocNotes)
+        os << "                note: " << note << "\n";
+
+    os << "\n";
 }
 }
 
