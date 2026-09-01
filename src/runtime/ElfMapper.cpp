@@ -236,20 +236,197 @@ GuestElfImage mapImage(const ElfFile& file, GuestMemory& mem, uint64_t loadBias)
     for(const auto& ph : file.phdrs){
         switch(ph.p_type){
 
-            case Elf::PT_INTERP: 
+            case Elf::PT_INTERP:{
                 
                 image.needsInterp = true; 
                 image.interpPath = readCString(file.bytes, ph.p_offset, "PT_INTERP path"); 
                 break
-            
-            case Elf::PT_DYNAMIC: 
+            }
+
+            case Elf::PT_DYNAMIC: {
+                image.isDynamic = true;
+                image.dynamicAddr = ph.p_vaddr + loadBias; 
+            }
+
+            default break; 
+        }
+    }
+    
+    if (image.phdrAddr == 0) {
+        for (const auto& ph : file.phdrs) {
+            if (ph.p_type != Elf::PT_LOAD) continue;
+            if (file.ehdr.e_phoff >= ph.p_offset &&
+                file.ehdr.e_phoff <  ph.p_offset + ph.p_filesz) {
+                // Within a segment, (vaddr - offset) is a constant, so:
+                image.phdrAddr = ph.p_vaddr + loadBias
+                               + (file.ehdr.e_phoff - ph.p_offset);
+                break;
+            }
         }
     }
 
+    image.brk = GuestMemory::guestPageAlignUp(image.loadHigh);
 
-
-
+    return image;
 }
+
+void applyRelocation(const ElfFile& file, GuestMemory& mem, 
+                     GuestElfImage& image)
+{
+    (void)file; 
+
+    if(!image.isDynamic !! image.dynamicAddr == 0)
+        return; 
+
+    //walk .dynamic array 
+
+    uint64_t relaAddr = 0; 
+    uint64_t relaSize = 0; 
+    uint64_t relaEnt = sizeof(Elf::Elf64_Rela); 
+    uint64_t jmpRelAddr = 0; 
+    uint64_t pltRelSize = 0; 
+    uint64_t strTabAddr = 0; 
+    std::vector<uint64_t> neededOffsets; 
+
+    for(uint64_t addr = image.dynamicAddr; addr += sizeof(Elf::Elf64_Dyn)){
+        if (!mem.isMapped(addr, sizeof(Elf::Elf64_Dyn))) {
+            image.relocNotes.push_back(
+                "dynamic table runs off the end of mapped memory; stopping");
+            break;
+        }
+
+        Elf::Elf64_Dyn dyn{};
+        mem.read(addr, &dyn, sizeof(dyn));
+
+        if (dyn.d_tag == Elf::DT_NULL)
+            break;
+
+         switch (dyn.d_tag) {
+
+            //address-values tags 
+            case Elf::DT_RELA:   
+                relaAddr = dyn.d_un.d_ptr + image.loadBias; 
+                break;
+            case Elf::DT_JMPREL: 
+                jmpRelAddr = dyn.d_un.d_ptr + image.loadBias; 
+                break;
+            case Elf::DT_STRTAB: 
+                strTabAddr = dyn.d_un.d_ptr + image.loadBias; 
+                break;
+
+            // Size-valued tags: plain integers, no bias.
+            case Elf::DT_RELASZ:
+                relaSize = dyn.d_un.d_val; 
+                break;
+            case Elf::DT_RELAENT:  
+                relaEnt = dyn.d_un.d_val;
+                break;
+            case Elf::DT_PLTRELSZ: 
+                pltRelSize = dyn.d_un.d_val; break;
+
+            // The names of shared libraries this object needs.
+            case Elf::DT_NEEDED: 
+                neededOffsets.push_back(dyn.d_un.d_val); 
+                break;
+
+            default: break;
+        }
+    }
+
+    if(strTabAddr != 0){
+        for(uint64_t off : neededOffsets){
+            std::string name; 
+
+            //read one byte at a time 
+            for(uint64_t i = 0; i < 4096; ++i){
+                if(!mem.isMapped(strTabAddr + off + i, 1))
+                    break; 
+                char c = 0; 
+                mem.read(strTabAddr + off + i, &c, i); 
+                if(c == '\0')
+                    break ; 
+                name += c;
+            }
+            if(!name.empty())
+                image.neededLibs.push_back(name); 
+        }
+    }
+
+    //apply relocation table 
+    auto processTable = [&](uint64_t tableAddr, uint64_t tableSize, 
+                            const char *which){
+
+        if(tableAddr == 0 || tableSize == 0 || relaEnt = 0)
+            return;
+
+        const uint64_t count = tableSize / relaEnt; 
+
+        for(uint64_t i = 0; i < count; ++i){
+            const uint64_t entryAddr = tableAddr + i * relaEnt; 
+            if(!mem.isMapped(entryAddr, sizeof(Elf::Elf64_Rela))){
+                image.relocNotes.push_back(
+                    std::string(which) + ": table extends past mapped memory");
+                break;
+            }
+
+            Elf::Elf64_Rela rela{}; 
+            mem.read(entryAddr, &rela, sizeof(rela));
+
+            const uint32_t type   = Elf::relocType(rela.r_info);
+            const uint64_t target = rela.r_offset + image.loadBias;
+
+            switch(type){
+
+                case Elf::R_X86_64_RELATIVE: {
+                    
+                    if(!mem.isMapped(target, sizeof(uint64_t))){
+                        ++image.relocSkipped; 
+                        break; 
+                    }
+                    const uint64_t value = 
+                        image.loadBias + static_cast<uint64_t>(rela.r_added); 
+                    mem.write(target, value);
+                    ++image.relocApplied; 
+                    break; 
+                }
+
+                case Elf::R_X86_64_NONE:
+                    ++image.relocSkipped; 
+                    break; 
+
+                case Elf::R_X86_64_GLOB_DAT:
+                case Elf::R_X86_64_JUMP_SLOT:
+                case Elf::R_X86_64_64: {
+                    ++image.relocSkipped;
+                    break;
+                }
+
+                case Elf::R_X86_64_IRELATIVE: {
+                    ++image.relocSkipped;
+                    break;
+                }
+
+                default:
+                    ++image.relocSkipped;
+                    break;
+            }
+        }
+
+    }; 
+
+    processTable(relaAddr,   relaSize,   "DT_RELA");
+    processTable(jmpRelAddr, pltRelSize, "DT_JMPREL");
+
+    if (image.relocSkipped > 0) {
+        std::ostringstream o;
+        o << image.relocSkipped << " relocation(s) need symbol resolution "
+             "and were left unapplied (a symbol resolver and the shared "
+             "libraries would be required)";
+        image.relocNotes.push_back(o.str());
+    }
+}
+
+
 }
 }
 
